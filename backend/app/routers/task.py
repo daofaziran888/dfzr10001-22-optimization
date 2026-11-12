@@ -1,4 +1,8 @@
-"""采集任务接口：维护采集任务，覆盖提交执行、暂停任务、恢复任务等动作。"""
+"""采集任务接口：维护采集任务，覆盖提交执行、暂停任务、恢复任务等动作。
+
+任务解析与诊断接口显式回传生效版本号：输入格式、字段映射、类型转换、默认值、
+校验正则、输出格式全部按任务钉住的版本快照读取。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,12 +11,13 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.task import TaskService
+from app.versions import registry
 
 router = APIRouter(prefix="/api/task", tags=["采集任务"])
 
 service = TaskService()
 
-LIST_FIELDS = ["任务编号", "任务名称", "关联源端", "采集频率", "增量字段", "起始水位", "批次大小", "执行窗口"]
+LIST_FIELDS = ["任务编号", "任务名称", "关联源端", "采集频率", "增量字段", "起始水位", "批次大小", "执行窗口", "解析模板编号", "模板版本"]
 STATUSES = ["草稿", "待执行", "执行中", "已完成"]
 
 
@@ -27,7 +32,21 @@ def list_entries(
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    # 工作台需要展示每个任务实际钉住的版本与模板当前生效版本的差异。
+    for item in items:
+        template_code = item.get("解析模板编号")
+        if template_code:
+            effective = registry.effective_version(str(template_code))
+            item["当前模板生效版本"] = effective
+            item["版本落后"] = effective is not None and effective != item.get("模板版本")
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/version-todos")
+def task_version_todos() -> dict[str, Any]:
+    """任务工作台的版本失败待办入口：切换失败/并发冲突在此可见。"""
+    items = registry.list_todos()
+    return {"total": len(items), "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -37,6 +56,39 @@ def get_entry(entry_id: int) -> dict:
     if entry is None:
         raise HTTPException(status_code=404, detail=f"采集任务 {entry_id} 不存在或已归档")
     return entry
+
+
+@router.get("/{entry_id}/diagnostics")
+def get_diagnostics(entry_id: int) -> dict[str, Any]:
+    """任务的历史诊断：按诊断当时的版本号原样返回，不随模板切换改写。"""
+    items, message = service.list_diagnostics(entry_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail=message)
+    return {"任务ID": entry_id, "total": len(items), "items": items}
+
+
+@router.post("/{entry_id}/parse", response_model=ActionResult)
+def parse_task_input(entry_id: int, payload: EntryPayload) -> ActionResult:
+    """按任务钉住的模板版本解析输入，结果与诊断都带生效版本号。"""
+    data = payload.values.get("数据")
+    if not isinstance(data, dict):
+        return ActionResult(ok=False, message="缺少待解析数据：values.数据 必须是对象")
+    result, message = service.parse_input(entry_id, data)
+    if result is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=bool(result.get("通过")), message="解析完成，诊断已按生效版本回写", entry=result)
+
+
+@router.post("/{entry_id}/bind-parser", response_model=ActionResult)
+def bind_parser(entry_id: int, payload: EntryPayload) -> ActionResult:
+    """绑定/改绑解析模板，钉住当前生效版本。"""
+    template_code = str(payload.values.get("解析模板编号") or "").strip()
+    if not template_code:
+        return ActionResult(ok=False, message="缺少参数：解析模板编号")
+    entry, message = service.bind_template(entry_id, template_code)
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
 
 
 @router.post("", response_model=ActionResult)
